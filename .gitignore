@@ -1,1 +1,4 @@
 jobs
+datasets/
+results/
+__pycache__/

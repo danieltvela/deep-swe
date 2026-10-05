@@ -71,3 +71,16 @@ Single task:
 pier run -p deep-swe/tasks/<task-id> --agent mini-swe-agent
 ```
 
+## Local model evaluation
+
+This fork adds a harness for evaluating models served locally, with language
+selection, stored results (model name, quantization, lab, variant, and total
+runtime), and an HTML comparison report. See [`eval/README.md`](eval/README.md).
+
+```bash
+python3 eval/deepswe_eval.py build                                  # rust/typescript/javascript/python/go, 113 tasks
+python3 eval/deepswe_eval.py smoke --model mimo-v2.6-flash          # end-to-end plumbing check
+python3 eval/deepswe_eval.py run --model mimo-v2.6-flash --languages python --n-tasks 8
+python3 eval/deepswe_eval.py report                                 # results/report.html
+```
+

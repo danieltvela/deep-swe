@@ -1,0 +1,95 @@
+# Model registry for local DeepSWE evaluations.
+#
+# Each key is a model id you pass to `deepswe_eval.py run --model <id>`.
+# The four identity fields (name, quantization, lab, variant) are stored with
+# every run and shown in the HTML report; edit them to match what you are
+# actually evaluating.
+#
+# The `serving` block records the deployment configuration that also drives
+# quality and speed: context length, KV-cache dtype, tensor parallelism, GPUs,
+# reasoning budget and serving stack. Fill it in per model; unknown values stay
+# as "unspecified". `reasoning_effort` is also read from the agent kwargs, so
+# whatever is actually sent is recorded.
+#
+# Networking: task containers have no direct internet access. pier routes model
+# traffic through an egress proxy that only permits ports 80 and 443, so the
+# harness exposes the model gateway on the docker bridge gateway at port 80
+# (`deepswe_eval.py forwarder start`, target 127.0.0.1:4000 by default).
+# `172.17.0.1.nip.io` resolves to that gateway. `model_class: litellm` forces
+# the chat-completions adapter; without it, mini-swe-agent picks the OpenAI
+# Responses adapter for `openai/...` models.
+#
+# `env` values support ${VAR} and ${VAR:-default} expansion from your shell.
+
+models:
+  # Routed through LiteLLM (the default forwarder target).
+  mimo-v2.6-flash:
+    name: mimo-v2.6-flash
+    quantization: unspecified   # edit: e.g. bf16, fp8, Q4_K_M
+    lab: Xiaomi                 # edit as needed
+    variant: flash              # edit as needed
+    serving:
+      context_length: 448512    # reported by the vLLM /v1/models endpoint
+      kv_cache_dtype: unspecified
+      tensor_parallel: unspecified
+      gpus: unspecified
+      reasoning_effort: unspecified
+      stack: vLLM
+      notes: ""
+    agent:
+      name: mini-swe-agent
+      model_name: openai/swe-agentic
+      env:
+        OPENAI_BASE_URL: http://172.17.0.1.nip.io/v1
+        OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
+        MSWEA_API_KEY: ${LITELLM_MASTER_KEY}
+      kwargs:
+        model_class: litellm
+
+  gemma4-31b:
+    name: gemma4-31b
+    quantization: unspecified
+    lab: Google
+    variant: instruct
+    serving:
+      context_length: unspecified
+      kv_cache_dtype: unspecified
+      tensor_parallel: unspecified
+      gpus: unspecified
+      reasoning_effort: unspecified
+      stack: vLLM
+      notes: ""
+    agent:
+      name: mini-swe-agent
+      model_name: openai/chat-agentic
+      env:
+        OPENAI_BASE_URL: http://172.17.0.1.nip.io/v1
+        OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
+        MSWEA_API_KEY: ${LITELLM_MASTER_KEY}
+      kwargs:
+        model_class: litellm
+
+  # Direct vLLM, bypassing LiteLLM. Start the forwarder with
+  #   python3 eval/deepswe_eval.py forwarder start --target 127.0.0.1:8005
+  mimo-v2.6-flash-direct:
+    name: mimo-v2.6-flash
+    quantization: unspecified
+    lab: Xiaomi
+    variant: flash
+    serving:
+      context_length: 448512
+      kv_cache_dtype: unspecified
+      tensor_parallel: unspecified
+      gpus: unspecified
+      reasoning_effort: unspecified
+      stack: vLLM
+      notes: "direct vLLM endpoint, no LiteLLM"
+    agent:
+      name: mini-swe-agent
+      model_name: openai/mimo-v2.6-flash
+      env:
+        OPENAI_BASE_URL: http://172.17.0.1.nip.io/v1
+        OPENAI_API_KEY: dummy
+        MSWEA_API_KEY: dummy
+      kwargs:
+        model_class: litellm

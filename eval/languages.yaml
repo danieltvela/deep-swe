@@ -1,0 +1,46 @@
+# Language selection for the local DeepSWE evaluation harness.
+#
+# Tasks are classified by the test runner they actually invoke (parsed from
+# tests/test.sh), because task.toml's `language` field is wrong for a few tasks.
+# `families` is evaluated in order: the first family whose `detect` tokens appear
+# in `require_cmd ...` calls wins. Order matters: `node` is checked before
+# `python` because TypeScript tasks also require `python3` for their reporters.
+# The `node` family is split into typescript/javascript using the declared
+# task.toml language (the corpus contains both TS and JS repos).
+
+families:
+  - name: rust
+    detect: [cargo, cargo-nextest]
+  - name: go
+    detect: [go]
+  - name: node
+    detect: [node, npm, pnpm, bunx, npx, yarn, deno, corepack]
+    split_by_declared: true
+    declared_languages: [typescript, javascript]
+    default_language: typescript
+  - name: python
+    detect: [pytest, python, python3]
+  - name: swift
+    detect: [swift]
+  - name: kotlin
+    detect: [gradle, mvn, kotlinc]
+
+# Languages copied into the filtered dataset. JavaScript is kept alongside
+# TypeScript: both use the node runner, and the corpus labels them separately.
+# Add "swift" or "kotlin" here once tasks for them exist in tasks/.
+enabled_languages: [rust, typescript, javascript, python, go]
+
+# Explicit corrections. The runner-based classification already handles these,
+# but pinning them keeps the intent visible if the upstream corpus changes.
+overrides:
+  httpx-deterministic-cookie-store: python
+  koota-entity-snapshot-rollback: typescript
+  prometheus-transactional-reload-status: go
+
+# Guard rails for `build`: fail loudly if the corpus changes unexpectedly.
+expected_counts:
+  rust: 5
+  typescript: 34
+  python: 34
+  go: 35
+  javascript: 5
