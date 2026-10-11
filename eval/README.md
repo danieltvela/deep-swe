@@ -179,18 +179,106 @@ To re-parse an existing pier job (for example one you ran by hand):
 python3 eval/deepswe_eval.py collect --job <job-name> --model my-model
 ```
 
+## Overnight batch driver
+
+`eval/nightly.py` walks the whole corpus in a fixed, reproducible, language-balanced
+order (seeded), inside a nightly window, sequentially, cleaning pier's docker images
+between batches and persisting progress so it resumes on later nights.
+
+```bash
+setsid nohup python3 eval/nightly.py --model mimo-v2.6-flash \
+    --start-now --start-at 22:00 --end-at 08:00 --budget-hours 24 \
+    --task-timeout-min 60 >> results/nightly.log 2>&1 < /dev/null &
+```
+
+- `--start-now` applies only to the first window; later windows wait for `--start-at`.
+- `--budget-hours` caps each window; combined with `--end-at` it stops at a fixed hour.
+- The batch size is derived from the remaining window and the per-task cap.
+- Only tasks that actually produced trials are marked done; an empty batch is
+  discarded and retried, and a task is given up after `--max-attempts` failures.
+- Before each batch it does a real 1-token generation through the same base URL the
+  agent uses, and accepts only a well-formed chat completion. A plain `/v1/models`
+  probe is not enough: with a different model profile running (models are mutually
+  exclusive on one port), the gateway still answers while the alias points at a
+  backend that is not serving.
+- State: `results/nightly-state.json`; log: `results/nightly.log`.
+- When the corpus completes it regenerates the report and exits on its own.
+- For a bounded check rather than a full night, combine `--once --max-tasks N` with a
+  short `--budget-hours` (for example `--budget-hours 0.5 --task-timeout-min 24
+  --max-tasks 1`): the window opens immediately with `--start-now` and the driver
+  exits after the task, so it never rolls into the next night.
+
+## Evaluating a second model
+
+The task order is deterministic, so a second model walks the *same* sequence and the
+two are comparable task by task. Give each model its own state file, and repoint the
+forwarder at the new server first:
+
+```bash
+# forwarder start keeps the existing target when the container is already running
+python3 eval/deepswe_eval.py forwarder stop
+python3 eval/deepswe_eval.py forwarder start --target 127.0.0.1:8005
+
+setsid nohup python3 eval/nightly.py --model glm-5.3-flash \
+    --state results/nightly-state-glm.json \
+    --start-at 22:00 --end-at 08:00 --budget-hours 10 \
+    >> results/nightly-glm.log 2>&1 < /dev/null &
+```
+
+Two things to watch when swapping models:
+
+- **Mutual exclusion.** Locally served profiles that use both GPUs and the same port
+  cannot run at once. Switch the profile before the window opens, or the driver will
+  simply wait (it detects the dead alias rather than burning the night).
+- **The forwarder target.** `forwarder start --target 127.0.0.1:<port>` decides which
+  server port 80 reaches. If you point it at a model server directly, address the
+  model by its served name (for example `openai/glm-5.3-flash-local`); if you keep it
+  on LiteLLM, add an alias there.
+
+Write-ups per model live in `eval/reports/`.
+
 ## Report
 
 `python3 eval/deepswe_eval.py report` writes a self-contained `results/report.html`
 (no CDN, data embedded as JSON) with:
 
-- a runs comparison table (model identity, pass rate, duration);
-- an **efficiency view**: per-run cost/quality metrics (agent-hours per task and
-  per resolved task, output tokens per task and per resolved task, reasoning
-  share, seconds per step, steps per task) plus a Pareto scatter of pass rate
-  against agent-hours per task, where highlighted points are non-dominated;
+- a **Models (aggregated)** table: all runs of the same `model.id` collapse into one
+  row (runs, tasks, pass rate with 95% CI, resolved, mean f2p, near-misses, p2p
+  regressions, agent hours, tokens, reasoning share). A task evaluated more than
+  once counts once, using the most recent result;
+- a **Pareto scatter**, one point per model: pass rate against agent-hours per
+  task, with non-dominated points highlighted;
+- a per-run table (a "show plumbing runs" checkbox reveals oracle/smoke runs,
+  which are hidden by default and excluded from every aggregate);
+- **graded metrics** next to the binary score (see below);
 - per-run language breakdown and a filterable/sortable task table;
 - a side-by-side comparison of two runs over their shared tasks.
+
+Aggregation happens when the report is generated, so you can inspect partial
+progress at any point instead of waiting for the corpus to finish.
+
+### Graded vs binary scoring
+
+`reward` is binary: 1 only when every fail-to-pass test passes and no
+pass-to-pass test regresses. That is the official DeepSWE score and the
+leaderboard-comparable one.
+
+`partial` is `(f2p_passed + p2p_passed) / (f2p_total + p2p_total)`. Because
+pass-to-pass tests usually outnumber fail-to-pass tests many times over, a task
+with 4/6 f2p and 62/62 p2p still reads ~0.97, so **partial is not a good graded
+signal**. The report therefore adds:
+
+- **mean f2p**: the fraction of fail-to-pass tests resolved, averaged per task —
+  it measures how much of the requested behaviour was implemented;
+- **near-miss**: tasks with f2p ≥ 0.9 that still score 0;
+- **p2p regressions**: tasks where a previously passing test broke;
+- **95% CI** (Wilson): the interval around the pass rate, so small differences
+  between models are not over-read when n is small.
+
+- **f2p (fail-to-pass)**: tests that failed before the change and must pass after
+  it; they encode the new behaviour the task asks for.
+- **p2p (pass-to-pass)**: tests that already passed and must keep passing; the
+  regression guard.
 
 ### Cost and token metrics
 
@@ -225,6 +313,108 @@ build timeout is not consumed by the pull:
 ```bash
 docker pull "$(grep docker_image datasets/deep-swe-local/tasks/anko-default-function-arguments/task.toml | cut -d'"' -f2)"
 ```
+
+## Lessons from running the full corpus
+
+Everything below came out of running four models over the corpus — MiMo-V2.6-Flash
+and GLM-5.3-Flash over all 113 tasks, Qwen3.8-Flash-Next and Laguna-S-2.1 over the
+five Rust tasks. Per-model write-ups are in `eval/reports/`.
+
+### Audit the verifiers before trusting a number
+
+A verifier that cannot build the project reports every test as failed, which is
+indistinguishable from a model that failed everything. In one run
+`oxvg-structural-selector-preservation` came back 0/6 and 0/62 because the
+verification container could not reach `static.crates.io`: both the base mode and
+the new mode failed with `rc=102`, and the harness counted every test as failed
+because no JUnit output was produced. The check is a `grep` over the trial output:
+
+```bash
+grep -lE "Could not resolve host" jobs/*/*/verifier/test-stdout.txt
+# also suspicious: identical, non-zero rc values for the base and the new mode
+```
+
+Across 194 verifier logs from these runs, exactly one was invalid. When it happens,
+remove the task from `completed` in the state file, reset its `attempts` entry, and
+re-run it — the second pass is usually fine.
+
+### Scheduling traps
+
+- `--start-at` defaults to 22:00. A window that closes after that hour sends the
+  daemon to sleep until the *next* 22:00 (22 hours idle). Pass `--start-at 00:00`
+  for continuous runs.
+- A batch is never interrupted at the window end, so a window can close after its
+  own start boundary. `nightly.py` now opens a new window immediately when the
+  current daily window still has room for a whole task (`window_remaining_min`)
+  instead of waiting for the next day; before that fix, a batch crossing midnight
+  parked a run for 23.7 h with four tasks left.
+- `--max-tasks N` is a cumulative cap on the tasks recorded in the state file, not
+  a per-window limit: with 41 tasks already done, `--max-tasks 2` closes the window
+  instantly. For a bounded window pass the absolute target (`--max-tasks 43`).
+- Batch size is `remaining_window_minutes // task_timeout_min`, so 24 h at the
+  180 min cap asks for 8 tasks and 12 h for 3-4. Bigger batches mean more task
+  images alive at once (~8 GB per task).
+
+### Stopping and resuming
+
+Kill the daemon's process group (launched with `setsid`, the pid is the pgid) and
+remove any leftover trial containers. Nothing already completed is lost: the state
+advances when a batch closes. Then salvage what the interrupted batch finished:
+
+```bash
+python3 eval/deepswe_eval.py collect --job <batch> --model <model-id>
+```
+
+Mark those tasks completed in the state file and reset `attempts` for the task that
+was in flight. `attempts` is incremented *before* a batch runs, so an interrupted
+task carries a failed attempt; reset it, or repeated interruptions will eventually
+drop the task.
+
+### Keep the benchmark's own per-task cap
+
+Each `task.toml` declares 180 minutes. A shorter cap truncates long tasks and
+distorts the comparison: `oxvg` scored 0/6 under a 60-minute cap and 4/6 under the
+benchmark's own, taking 75 minutes. When a window has to end by 08:00, move the
+window rather than the cap — hence the 22:00-05:00 nightly windows.
+
+### Serving quirks that reach the metrics
+
+- **Reasoning in a non-standard field.** One server returned its thinking in
+  `reasoning` instead of `reasoning_content` and always reported
+  `reasoning_tokens = 0`, so every reasoning metric read zero for that model even
+  though the text was in the trajectory.
+- **Context window exhaustion.** An agent whose prompt exceeded the model's window
+  (263,213 tokens against a 262,144 limit) crashed before committing; the harness
+  graded an empty patch and recorded a plain zero, indistinguishable from a model
+  that never understood the task. Worth checking `peak_context_tokens` for models
+  with small windows.
+
+### Reading the aggregates
+
+- `mean f2p` per task and pooled `sum(f2p_passed)/sum(f2p_total)` answer different
+  questions. Pooling weights every test equally and is dominated by the big
+  Python/TypeScript suites; the per-task mean weights every task equally. Report
+  both, and say which one a number is.
+- Pooled **p2p** is not a discriminator: five tasks hold 75.5% of the 231,352
+  regression tests in the corpus (`expr-try-catch-errors` alone holds 38.7%), so a
+  single task can move the pooled percentage by ~39 points. Count tasks with
+  regressions instead of pooling.
+- **Near-misses matter as much as the pass rate.** At the end of the GLM run, 25 of
+  its 37 failures were tasks passing 90-99% of their target tests. The band
+  distribution (all-passed / 90-99 / 50-89 / under 50) is the chart that explains a
+  pass rate; the harness records enough to produce it.
+
+### Where the records live
+
+| What | Where |
+| --- | --- |
+| One record per run | `results/runs/<run-id>.json` (model identity, serving block, per-task results, timings, tokens) |
+| Index of runs | `results/index.json` |
+| Interactive report | `results/report.html` |
+| Per-trial raw data | `jobs/<batch>/<task>__<hash>/` (agent trajectory, container logs, verifier output, `result.json`) |
+| Progress state | `results/nightly-state-<model>.json` |
+| Written conclusions | `eval/reports/*.md` |
+| Driver logs | `results/nightly*.log` |
 
 ## Troubleshooting
 

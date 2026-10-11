@@ -1056,21 +1056,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <main>
   <div class="cards" id="cards"></div>
 
-  <h2>Runs</h2>
-  <div class="panel scroll"><table id="runsTable"></table></div>
+  <details class="panel">
+    <summary style="cursor:pointer;font-weight:600">How to read these metrics</summary>
+    <ul style="margin-top:10px">
+      <li><b>reward (pass/fail)</b>: 1 only when <i>every</i> fail-to-pass test passes and
+        <i>no</i> pass-to-pass test regresses. This is the official, binary DeepSWE score.</li>
+      <li><b>f2p (fail-to-pass)</b>: tests that failed before the change and must pass after it.
+        They measure how much of the requested behaviour was actually implemented.</li>
+      <li><b>p2p (pass-to-pass)</b>: tests that already passed and must keep passing. They are the
+        regression guard.</li>
+      <li><b>partial</b>: (f2p_passed + p2p_passed) / (f2p_total + p2p_total). Pass-to-pass tests
+        usually outnumber fail-to-pass tests many times over, so a task with 4/6 f2p and 62/62 p2p
+        still reads ~0.97. Treat <b>mean f2p</b> as the honest graded signal, not partial.</li>
+      <li><b>Near-miss</b>: tasks with f2p ≥ 0.9 that still score 0. They rank models that are
+        close but not exact.</li>
+      <li><b>p2p regressions</b>: tasks where a previously passing test broke. A real failure even
+        when most f2p pass.</li>
+      <li><b>95% CI</b>: Wilson interval on the pass rate. With few tasks it is wide, so read
+        small differences between models with care.</li>
+    </ul>
+  </details>
 
-  <h2>Efficiency: quality vs cost</h2>
+  <h2>Models (aggregated)</h2>
   <div class="panel">
-    <div class="muted" id="effNote"></div>
-    <div class="scroll"><table id="effTable"></table></div>
+    <div class="muted" id="modelsNote"></div>
+    <div class="scroll"><table id="modelsTable"></table></div>
   </div>
   <div class="panel">
-    <div class="muted">Pass rate vs agent-hours per task. Highlighted points are on the
-      Pareto frontier (no other run is both cheaper and better). Circle size scales with
-      output tokens per task. Agent-hours are the model's own wall time, which with the
-      sequential default approximates GPU-hours.</div>
+    <div class="muted">Pass rate vs agent-hours per task, one point per model.
+      Highlighted points are on the Pareto frontier (no other model is both cheaper
+      and better). Circle size scales with output tokens per task. Agent-hours are the
+      model's own wall time, which with the sequential default approximates GPU-hours.</div>
     <div id="pareto"></div>
   </div>
+
+  <h2>Runs
+    <label class="muted" style="font-size:12px;font-weight:400;margin-left:12px">
+      <input type="checkbox" id="showPlumbing"> show plumbing runs (oracle / smoke)
+    </label>
+  </h2>
+  <div class="panel scroll"><table id="runsTable"></table></div>
 
   <h2>Run detail</h2>
   <div class="panel">
@@ -1108,14 +1133,36 @@ function pct(x) { return (x * 100).toFixed(1) + '%'; }
 
 function renderCards() {
   const cards = document.getElementById('cards');
-  const totalTasks = runs.reduce((a, r) => a + r.summary.n_tasks, 0);
-  const totalResolved = runs.reduce((a, r) => a + r.summary.n_resolved, 0);
-  const totalDur = runs.reduce((a, r) => a + (r.duration_sec || 0), 0);
+  const modelRuns = runs.filter(isEvalRun);
+  // A task evaluated more than once (say, re-run after a protocol change) counts
+  // once per model, with the most recent result — same rule as the Models table.
+  const byTime = [...modelRuns].sort(
+    (a, b) => String(a.started_at || '').localeCompare(String(b.started_at || ''))
+  );
+  const taskMap = new Map();
+  byTime.forEach(r => (r.tasks || []).forEach(t => {
+    taskMap.set(`${(r.model || {}).id || r.run_id}|${t.task_id}`, t);
+  }));
+  const tasks = [...taskMap.values()];
+  const totalTasks = tasks.length;
+  const totalResolved = tasks.filter(t => t.reward === 1).length;
+  const totalDur = modelRuns.reduce((a, r) => a + (r.duration_sec || 0), 0);
+  const fracs = [];
+  let nearMiss = 0;
+  tasks.forEach(t => {
+    if (t.f2p_total) {
+      fracs.push(t.f2p_passed / t.f2p_total);
+      if (t.reward !== 1 && (t.f2p_passed / t.f2p_total) >= 0.9) nearMiss++;
+    }
+  });
+  const meanF2p = fracs.length ? fracs.reduce((a, b) => a + b, 0) / fracs.length : null;
   const items = [
-    ['Runs', runs.length],
+    ['Evaluation runs', modelRuns.length],
     ['Tasks evaluated', totalTasks],
     ['Resolved', totalResolved],
     ['Overall pass rate', totalTasks ? pct(totalResolved / totalTasks) : '-'],
+    ['Mean f2p (graded)', meanF2p === null ? '-' : pct(meanF2p)],
+    ['Near-misses', nearMiss],
     ['Total wall time', (totalDur / 3600).toFixed(1) + ' h'],
   ];
   items.forEach(([k, v]) => {
@@ -1152,6 +1199,7 @@ function sortTable(table, key) {
 
 function renderRunsTable() {
   const table = document.getElementById('runsTable');
+  table.innerHTML = '';
   const cols = [
     { key: 'run_id', label: 'Run' },
     { key: 'kind', label: 'Kind' },
@@ -1168,7 +1216,8 @@ function renderRunsTable() {
     { key: 'started_at', label: 'Started' },
   ];
   tableHeader(table, cols);
-  runs.forEach(r => {
+  const showPlumbing = document.getElementById('showPlumbing').checked;
+  runs.filter(r => showPlumbing || isEvalRun(r)).forEach(r => {
     const m = r.model || {};
     const vals = {
       run_id: r.run_id,
@@ -1244,8 +1293,9 @@ function renderDetail() {
   table.innerHTML = '';
   const cols = [
     { key: 'task_id', label: 'Task' }, { key: 'language', label: 'Language' },
-    { key: 'reward', label: 'Reward' }, { key: 'partial', label: 'Partial' },
-    { key: 'f2p', label: 'f2p' }, { key: 'p2p', label: 'p2p' },
+    { key: 'reward', label: 'Reward' }, { key: 'f2p', label: 'f2p' },
+    { key: 'f2pPct', label: 'f2p %' }, { key: 'p2p', label: 'p2p' },
+    { key: 'partial', label: 'Partial' },
     { key: 'status', label: 'Status' }, { key: 'duration_sec', label: 'Duration' },
   ];
   tableHeader(table, cols);
@@ -1253,10 +1303,12 @@ function renderDetail() {
     .filter(t => lang === 'all' || t.language === lang)
     .filter(t => !q || t.task_id.toLowerCase().includes(q))
     .forEach(t => {
+      const f2pPct = t.f2p_total ? t.f2p_passed / t.f2p_total : null;
       const vals = {
         task_id: t.task_id, language: t.language,
         reward: t.reward, partial: t.partial,
         f2p: t.f2p_total ? `${t.f2p_passed}/${t.f2p_total}` : '',
+        f2pPct: f2pPct,
         p2p: t.p2p_total ? `${t.p2p_passed}/${t.p2p_total}` : '',
         status: t.status, duration_sec: t.duration_sec,
       };
@@ -1265,8 +1317,13 @@ function renderDetail() {
         const td = el('td');
         tr.dataset['v_' + c.key] = vals[c.key] ?? '';
         if (c.key === 'reward') {
-          td.textContent = vals[c.key] === 1 ? 'pass' : (vals[c.key] === 0 ? 'fail' : 'n/a');
+          const near = t.reward !== 1 && f2pPct !== null && f2pPct >= 0.9;
+          td.textContent = (vals[c.key] === 1 ? 'pass' : (vals[c.key] === 0 ? 'fail' : 'n/a'))
+            + (near ? ' (near)' : '');
           td.className = vals[c.key] === 1 ? 'ok' : (vals[c.key] === 0 ? 'bad' : 'muted');
+        } else if (c.key === 'f2pPct') {
+          td.textContent = f2pPct === null ? '' : pct(f2pPct);
+          td.className = 'num ' + (f2pPct === null ? '' : (f2pPct >= 0.9 ? 'ok' : 'bad'));
         } else if (c.key === 'partial') {
           td.textContent = vals[c.key] === null || vals[c.key] === undefined
             ? '' : vals[c.key].toFixed(3);
@@ -1322,55 +1379,132 @@ document.getElementById('langSelect').onchange = renderDetail;
 document.getElementById('search').oninput = renderDetail;
 document.getElementById('cmpA').onchange = renderCompare;
 document.getElementById('cmpB').onchange = renderCompare;
+document.getElementById('showPlumbing').onchange = renderRunsTable;
 
 function isModelRun(r) {
   return ((r.endpoint || {}).agent || '') !== 'oracle';
 }
 
-function runMetrics(r) {
-  const s = r.summary || {}, t = s.tokens || {}, tm = s.time || {};
+// Plumbing checks (oracle, or a smoke run with a tiny timeout) must not pollute
+// the quality/cost aggregates.
+function isEvalRun(r) {
+  return isModelRun(r) && !String(r.kind || 'eval').startsWith('smoke');
+}
+
+function wilson(k, n) {
+  if (!n) return null;
+  const z = 1.96, p = k / n, d = 1 + z * z / n;
+  const centre = (p + z * z / (2 * n)) / d;
+  const half = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d;
+  return [Math.max(0, centre - half), Math.min(1, centre + half)];
+}
+
+function coreMetrics(tasks) {
+  const n = tasks.length;
+  const resolved = tasks.filter(t => t.reward === 1).length;
+  const fracs = tasks.filter(t => t.f2p_total).map(t => t.f2p_passed / t.f2p_total);
+  const meanF2p = fracs.length ? fracs.reduce((a, b) => a + b, 0) / fracs.length : null;
+  const nearMiss = tasks.filter(
+    t => t.reward !== 1 && t.f2p_total && (t.f2p_passed / t.f2p_total) >= 0.9
+  ).length;
+  const p2pRegressions = tasks.filter(
+    t => t.p2p_total && t.p2p_passed !== t.p2p_total
+  ).length;
+  const sum = (key) => tasks.filter(t => t[key]).reduce((a, t) => a + t[key], 0);
+  const agentHours = sum('agent_execution_sec') ? sum('agent_execution_sec') / 3600 : null;
+  const outTok = sum('output_tokens'), reaTok = sum('reasoning_tokens'), steps = sum('steps');
+  const ci = wilson(resolved, n);
+  const per = (v, d) => (v !== null && d ? v / d : null);
   return {
-    agentHours: tm.agent_hours ?? null,
-    agentHoursPerTask: tm.agent_hours_per_task ?? null,
-    agentHoursPerResolved: tm.agent_hours_per_resolved ?? null,
-    outputPerTask: t.output_per_task ?? null,
-    outputPerResolved: t.output_per_resolved ?? null,
-    reasoningRatio: t.reasoning_ratio ?? null,
-    secondsPerStep: tm.seconds_per_step ?? null,
-    stepsPerTask: s.steps_per_task ?? null,
+    n: n, resolved: resolved, passRate: n ? resolved / n : 0,
+    ciText: ci ? `${pct(ci[0])}\u2013${pct(ci[1])}` : '',
+    meanF2p: meanF2p, nearMiss: nearMiss, p2pRegressions: p2pRegressions,
+    agentHours: agentHours,
+    agentHoursPerTask: per(agentHours, n),
+    agentHoursPerResolved: per(agentHours, resolved),
+    outputPerTask: per(outTok || null, n),
+    outputPerResolved: per(outTok || null, resolved),
+    reasoningRatio: (reaTok && outTok) ? reaTok / outTok : null,
+    stepsPerTask: per(steps || null, n),
+    secondsPerStep: (sum('agent_execution_sec') && steps) ? sum('agent_execution_sec') / steps : null,
   };
 }
 
-function renderEfficiency() {
-  const table = document.getElementById('effTable');
+// All runs of the same model id are aggregated into one row, so a model that was
+// evaluated across many nightly batches (or under updated metadata) shows up once.
+function aggregateByModel(evalRuns) {
+  const groups = new Map();
+  evalRuns.forEach(r => {
+    const id = (r.model || {}).id || r.run_id;
+    if (!groups.has(id)) groups.set(id, { id: id, runs: [], tasks: [] });
+    const g = groups.get(id);
+    g.runs.push(r);
+    g.tasks.push(...(r.tasks || []));
+  });
+  const pickLatest = (byTime, getter) => {
+    for (let i = byTime.length - 1; i >= 0; i--) {
+      const v = getter(byTime[i]);
+      if (v !== undefined && v !== null && v !== '' && v !== 'unspecified') return v;
+    }
+    return 'unspecified';
+  };
+  return [...groups.values()].map(g => {
+    const byTime = [...g.runs].sort(
+      (a, b) => String(a.started_at || '').localeCompare(String(b.started_at || ''))
+    );
+    // A task evaluated more than once counts once, with the most recent result.
+    const taskMap = new Map();
+    byTime.forEach(r => (r.tasks || []).forEach(t => taskMap.set(t.task_id, t)));
+    const tasks = [...taskMap.values()];
+    const serving = {};
+    ['context_length', 'kv_cache_dtype', 'tensor_parallel', 'gpus', 'reasoning_effort', 'stack'].forEach(k => {
+      serving[k] = pickLatest(byTime, r => (r.serving || {})[k]);
+    });
+    return {
+      id: g.id,
+      name: pickLatest(byTime, r => (r.model || {}).name),
+      quantization: pickLatest(byTime, r => (r.model || {}).quantization),
+      lab: pickLatest(byTime, r => (r.model || {}).lab),
+      variant: pickLatest(byTime, r => (r.model || {}).variant),
+      serving: serving,
+      nRuns: g.runs.length,
+      tasks: tasks,
+      m: coreMetrics(tasks),
+    };
+  });
+}
+
+function renderModels() {
+  const table = document.getElementById('modelsTable');
+  const groups = aggregateByModel(runs.filter(isEvalRun));
   const cols = [
-    { key: 'run_id', label: 'Run' }, { key: 'name', label: 'Model' },
-    { key: 'quantization', label: 'Quant' }, { key: 'context_length', label: 'Context' },
-    { key: 'kv_cache_dtype', label: 'KV' }, { key: 'tensor_parallel', label: 'TP' },
-    { key: 'gpus', label: 'GPUs' }, { key: 'reasoning_effort', label: 'Reasoning' },
-    { key: 'pass_rate', label: 'Pass rate' }, { key: 'n_resolved', label: 'Resolved' },
+    { key: 'name', label: 'Model' }, { key: 'lab', label: 'Lab' },
+    { key: 'variant', label: 'Variant' }, { key: 'quantization', label: 'Quant' },
+    { key: 'context_length', label: 'Context' }, { key: 'kv_cache_dtype', label: 'KV' },
+    { key: 'tensor_parallel', label: 'TP' }, { key: 'gpus', label: 'GPUs' },
+    { key: 'reasoning_effort', label: 'Reasoning' },
+    { key: 'nRuns', label: 'Runs' }, { key: 'n', label: 'Tasks' },
+    { key: 'passRate', label: 'Pass rate' }, { key: 'ciText', label: '95% CI' },
+    { key: 'resolved', label: 'Resolved' }, { key: 'meanF2p', label: 'Mean f2p' },
+    { key: 'nearMiss', label: 'Near-miss' }, { key: 'p2pRegressions', label: 'p2p regr.' },
     { key: 'agentHours', label: 'Agent h' }, { key: 'agentHoursPerTask', label: 'Agent h/task' },
     { key: 'agentHoursPerResolved', label: 'Agent h/resolved' },
     { key: 'outputPerTask', label: 'Out tok/task' },
-    { key: 'outputPerResolved', label: 'Out tok/resolved' },
-    { key: 'reasoningRatio', label: 'Reasoning %' }, { key: 'secondsPerStep', label: 's/step' },
-    { key: 'stepsPerTask', label: 'Steps/task' },
+    { key: 'reasoningRatio', label: 'Reasoning %' },
+    { key: 'secondsPerStep', label: 's/step' }, { key: 'stepsPerTask', label: 'Steps/task' },
   ];
   tableHeader(table, cols);
-  const modelRuns = runs.filter(isModelRun);
-  let withData = 0;
-  modelRuns.forEach(r => {
-    const m = runMetrics(r), s = r.summary || {}, sv = r.serving || {}, mod = r.model || {};
-    if (m.agentHours !== null) withData++;
+  groups.forEach(g => {
+    const m = g.m, sv = g.serving;
     const vals = {
-      run_id: r.run_id, name: mod.name, quantization: mod.quantization,
+      name: g.name, lab: g.lab, variant: g.variant, quantization: g.quantization,
       context_length: sv.context_length, kv_cache_dtype: sv.kv_cache_dtype,
       tensor_parallel: sv.tensor_parallel, gpus: sv.gpus,
       reasoning_effort: sv.reasoning_effort,
-      pass_rate: s.pass_rate, n_resolved: s.n_resolved,
+      nRuns: g.nRuns, n: m.n, passRate: m.passRate, ciText: m.ciText, resolved: m.resolved,
+      meanF2p: m.meanF2p, nearMiss: m.nearMiss, p2pRegressions: m.p2pRegressions,
       agentHours: m.agentHours, agentHoursPerTask: m.agentHoursPerTask,
-      agentHoursPerResolved: m.agentHoursPerResolved,
-      outputPerTask: m.outputPerTask, outputPerResolved: m.outputPerResolved,
+      agentHoursPerResolved: m.agentHoursPerResolved, outputPerTask: m.outputPerTask,
       reasoningRatio: m.reasoningRatio, secondsPerStep: m.secondsPerStep,
       stepsPerTask: m.stepsPerTask,
     };
@@ -1379,19 +1513,21 @@ function renderEfficiency() {
       const td = el('td');
       tr.dataset['v_' + c.key] = vals[c.key] ?? '';
       const v = vals[c.key];
-      if (c.key === 'pass_rate') {
+      if (c.key === 'passRate') {
         td.textContent = pct(v || 0);
         td.className = 'num ' + ((v || 0) >= 0.5 ? 'ok' : 'bad');
-      } else if (c.key === 'reasoningRatio') {
+      } else if (c.key === 'meanF2p' || c.key === 'reasoningRatio') {
         td.textContent = v == null ? '' : pct(v); td.className = 'num';
       } else if (['agentHours', 'agentHoursPerTask', 'agentHoursPerResolved'].includes(c.key)) {
         td.textContent = v == null ? '' : Number(v).toFixed(2); td.className = 'num';
-      } else if (['outputPerTask', 'outputPerResolved', 'stepsPerTask'].includes(c.key)) {
+      } else if (['outputPerTask', 'stepsPerTask'].includes(c.key)) {
         td.textContent = v == null ? '' : Math.round(v).toLocaleString(); td.className = 'num';
       } else if (c.key === 'secondsPerStep') {
         td.textContent = v == null ? '' : Number(v).toFixed(1); td.className = 'num';
-      } else if (c.key === 'n_resolved') {
+      } else if (['n', 'resolved', 'nRuns'].includes(c.key)) {
         td.textContent = v; td.className = 'num';
+      } else if (c.key === 'nearMiss' || c.key === 'p2pRegressions') {
+        td.textContent = v; td.className = 'num ' + (v ? 'bad' : '');
       } else {
         td.textContent = v ?? '';
       }
@@ -1399,10 +1535,12 @@ function renderEfficiency() {
     });
     table.appendChild(tr);
   });
-  document.getElementById('effNote').textContent =
-    `${withData} of ${modelRuns.length} model run(s) have agent timing data ` +
-    `(oracle runs are excluded). "Agent h/resolved" and "Out tok/resolved" stay ` +
-    `blank when a run resolved nothing.`;
+  const totalTasks = groups.reduce((a, g) => a + g.m.n, 0);
+  const totalRuns = groups.reduce((a, g) => a + g.nRuns, 0);
+  document.getElementById('modelsNote').textContent =
+    `${groups.length} model(s), ${totalTasks} evaluated task(s) across ${totalRuns} run(s), ` +
+    `aggregated by model id. Oracle and smoke runs are excluded. ` +
+    `"Agent h/resolved" and "Out tok/resolved" stay blank when a model resolved nothing.`;
 }
 
 function svgEl(name, attrs) {
@@ -1414,15 +1552,14 @@ function svgEl(name, attrs) {
 function renderPareto() {
   const host = document.getElementById('pareto');
   host.innerHTML = '';
-  const pts = runs
-    .filter(isModelRun)
-    .map(r => ({ r: r, m: runMetrics(r) }))
+  const pts = aggregateByModel(runs.filter(isEvalRun))
+    .map(g => ({ g: g, m: g.m }))
     .filter(p => p.m.agentHoursPerTask !== null && p.m.agentHoursPerTask > 0);
   if (!pts.length) { host.textContent = 'No agent timing data to plot yet.'; return; }
 
   const W = 880, H = 440, pad = { l: 64, r: 36, t: 24, b: 64 };
   const xmax = Math.max(...pts.map(p => p.m.agentHoursPerTask)) * 1.2;
-  const ymax = Math.max(0.05, Math.max(...pts.map(p => p.r.summary.pass_rate)) * 1.25);
+  const ymax = Math.max(0.05, Math.max(...pts.map(p => p.m.passRate)) * 1.25);
   const sx = x => pad.l + (x / xmax) * (W - pad.l - pad.r);
   const sy = y => H - pad.b - (y / ymax) * (H - pad.t - pad.b);
 
@@ -1450,44 +1587,43 @@ function renderPareto() {
   const sorted = [...pts].sort((a, b) => a.m.agentHoursPerTask - b.m.agentHoursPerTask);
   let best = -1; const frontier = [];
   sorted.forEach(p => {
-    if (p.r.summary.pass_rate > best) { best = p.r.summary.pass_rate; frontier.push(p); }
+    if (p.m.passRate > best) { best = p.m.passRate; frontier.push(p); }
   });
   if (frontier.length > 1) {
-    const d = frontier.map((p, i) => (i ? 'L' : 'M') + sx(p.m.agentHoursPerTask) + ',' + sy(p.r.summary.pass_rate)).join(' ');
+    const d = frontier.map((p, i) => (i ? 'L' : 'M') + sx(p.m.agentHoursPerTask) + ',' + sy(p.m.passRate)).join(' ');
     svg.appendChild(svgEl('path', { d: d, fill: 'none', stroke: '#4c9aff', 'stroke-width': 1.5, 'stroke-dasharray': '4 3' }));
   }
 
   const maxOut = Math.max(...pts.map(p => p.m.outputPerTask || 0), 1);
-  const onFrontier = new Set(frontier.map(p => p.r.run_id));
+  const onFrontier = new Set(frontier.map(p => p.g.id));
   pts.forEach(p => {
-    const isFront = onFrontier.has(p.r.run_id);
+    const isFront = onFrontier.has(p.g.id);
     const radius = 6 + 10 * ((p.m.outputPerTask || 0) / maxOut);
-    const cx = sx(p.m.agentHoursPerTask), cy = sy(p.r.summary.pass_rate);
+    const cx = sx(p.m.agentHoursPerTask), cy = sy(p.m.passRate);
     const circle = svgEl('circle', {
       cx: cx, cy: cy, r: radius, fill: isFront ? '#3fb950' : '#4c9aff',
       opacity: isFront ? 0.85 : 0.55, stroke: '#0f1419', 'stroke-width': 1,
     });
     const title = svgEl('title', {});
     title.textContent = [
-      p.r.run_id,
-      `${(p.r.model || {}).name || ''} (${(p.r.model || {}).quantization || ''})`,
-      `pass rate ${pct(p.r.summary.pass_rate)}`,
+      p.g.name,
+      `${p.g.lab} | ${p.g.quantization}`,
+      `${p.m.n} task(s) from ${p.g.nRuns} run(s), pass rate ${pct(p.m.passRate)}`,
       `${p.m.agentHoursPerTask.toFixed(2)} agent-h/task`,
       `${Math.round(p.m.outputPerTask || 0).toLocaleString()} out tok/task`,
       `reasoning ${p.m.reasoningRatio == null ? 'n/a' : pct(p.m.reasoningRatio)}`,
     ].join('\\n');
     circle.appendChild(title); svg.appendChild(circle);
     const label = svgEl('text', { x: cx, y: cy - radius - 4, fill: '#e6edf3', 'font-size': 10, 'text-anchor': 'middle' });
-    const mod = p.r.model || {};
-    label.textContent = (mod.name || p.r.run_id).slice(0, 18) + (mod.quantization ? ` ${mod.quantization}` : '');
+    label.textContent = (p.g.name || p.g.id).slice(0, 20) + (p.g.quantization && p.g.quantization !== 'unspecified' ? ` ${p.g.quantization}` : '');
     svg.appendChild(label);
   });
   host.appendChild(svg);
 }
 
 renderCards();
+renderModels();
 renderRunsTable();
-renderEfficiency();
 renderPareto();
 if (runs.length) { renderRunSelectors(); renderLangSelect(); renderDetail(); renderCompare(); }
 </script>
@@ -1530,6 +1666,47 @@ def cmd_report(args: argparse.Namespace) -> int:
 # clean
 # --------------------------------------------------------------------------- #
 
+PIER_IMAGE_RE = re.compile(r"__[A-Za-z0-9]{5,10}-(main|pier-egress-proxy)$")
+
+
+def pier_image_refs() -> list[str]:
+    """Docker image refs created by pier (task base images, agent and proxy builds).
+
+    Deliberately narrow: other images on the host (model servers, databases,
+    caches) must never be matched.
+    """
+    proc = subprocess.run(
+        ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+        capture_output=True, text=True, check=False,
+    )
+    refs = []
+    for line in proc.stdout.splitlines():
+        ref = line.strip()
+        if not ref or ref.startswith("<none>"):
+            continue
+        repo = ref.rsplit(":", 1)[0]
+        if "swe-bench-202605" in repo or PIER_IMAGE_RE.search(repo):
+            refs.append(ref)
+    return refs
+
+
+def cleanup_pier_images() -> int:
+    refs = pier_image_refs()
+    for ref in refs:
+        subprocess.run(["docker", "rmi", "-f", ref], capture_output=True, check=False)
+    # Dangling layers only; never -a, which would delete unrelated cached images.
+    subprocess.run(["docker", "image", "prune", "-f"], capture_output=True, check=False)
+    return len(refs)
+
+
+def disk_free_gb(path: Path = REPO_ROOT) -> float | None:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return None
+    return usage.free / (1024 ** 3)
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     if args.dataset:
         if DATASET_DIR.exists():
@@ -1538,24 +1715,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
         else:
             print("Dataset already absent.")
     if args.images:
-        manifest = load_manifest()
-        images = []
-        for task_id in manifest["tasks"]:
-            toml = DATASET_TASKS_DIR / task_id / "task.toml"
-            if not toml.exists():
-                continue
-            match = re.search(r'docker_image\s*=\s*"([^"]+)"', toml.read_text())
-            if match:
-                images.append(match.group(1))
-        if not images:
-            print("No task images found.")
+        refs = pier_image_refs()
+        if not refs:
+            print("No pier images found.")
             return 0
         if not args.yes:
-            print(f"Would remove {len(images)} image(s). Re-run with --yes.")
+            print(f"Would remove {len(refs)} pier image(s). Re-run with --yes.")
             return 0
-        for image in images:
-            subprocess.run(["docker", "rmi", image], check=False)
-        print(f"Removed up to {len(images)} image(s).")
+        removed = cleanup_pier_images()
+        print(f"Removed {removed} pier image(s); {disk_free_gb():.0f} GB free.")
     if not args.dataset and not args.images:
         print("Nothing to do. Use --dataset and/or --images.")
     return 0

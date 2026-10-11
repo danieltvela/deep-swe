@@ -23,19 +23,21 @@
 
 models:
   # Routed through LiteLLM (the default forwarder target).
+  # Values below come from ~/services/tesla-docker/docker-compose.yml
+  # (profile "mimo": MiMo-V2.6-Flash-MOPD, TP=2, DFlash speculative decoding).
   mimo-v2.6-flash:
-    name: mimo-v2.6-flash
-    quantization: unspecified   # edit: e.g. bf16, fp8, Q4_K_M
-    lab: Xiaomi                 # edit as needed
-    variant: flash              # edit as needed
+    name: MiMo-V2.6-Flash-MOPD
+    quantization: "W4A8 (MXFP4 experts + FP8 dense)"
+    lab: Xiaomi
+    variant: MOPD
     serving:
-      context_length: 448512    # reported by the vLLM /v1/models endpoint
-      kv_cache_dtype: unspecified
-      tensor_parallel: unspecified
-      gpus: unspecified
+      context_length: 448512
+      kv_cache_dtype: fp8
+      tensor_parallel: 2
+      gpus: "2x RTX PRO 6000 Blackwell Max-Q"
       reasoning_effort: unspecified
-      stack: vLLM
-      notes: ""
+      stack: "vLLM (mimo-v26-omni image, DFlash spec decode, kv-offloading)"
+      notes: "309B/15B active MoE; profile 'mimo' uses both GPUs exclusively"
     agent:
       name: mini-swe-agent
       model_name: openai/swe-agentic
@@ -66,6 +68,89 @@ models:
         OPENAI_BASE_URL: http://172.17.0.1.nip.io/v1
         OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
         MSWEA_API_KEY: ${LITELLM_MASTER_KEY}
+      kwargs:
+        model_class: litellm
+
+  # GLM-5.3-Flash, served by sglang on port 8005 under the `swe-agentic` profile
+  # (mutually exclusive with the mimo profile: same GPUs, same port).
+  #   docker compose --profile swe-agentic up -d glm53-flash-sm120
+  # This entry uses the direct path: point the forwarder at the model server
+  #   python3 eval/deepswe_eval.py forwarder start --target 127.0.0.1:8005
+  # (the alternative is to add a LiteLLM alias and use openai/<alias>).
+  glm-5.3-flash:
+    name: GLM-5.3-Flash
+    quantization: "W4A16 NVFP4 (K32 experts) + FP8 WO"
+    lab: Zhipu AI
+    variant: Flash
+    serving:
+      context_length: 524288
+      kv_cache_dtype: fp8_e4m3
+      tensor_parallel: 2
+      gpus: "2x RTX PRO 6000 Blackwell Max-Q"
+      reasoning_effort: unspecified
+      stack: "sglang (sglang-glm53-flash-sm120, EAGLE spec decode)"
+      notes: "profile 'swe-agentic'; same port as mimo, so the two cannot run together"
+    agent:
+      name: mini-swe-agent
+      model_name: openai/glm-5.3-flash-local
+      env:
+        OPENAI_BASE_URL: http://172.17.0.1.nip.io/v1
+        OPENAI_API_KEY: dummy
+        MSWEA_API_KEY: dummy
+      kwargs:
+        model_class: litellm
+
+  # Qwen3.8-Flash-Next, served by vLLM on port 8005 (container vllm-qwen-flash-next).
+  # Direct path: the forwarder must point at the model server
+  #   python3 eval/deepswe_eval.py forwarder start --target 127.0.0.1:8005
+  qwen3.8-flash-next:
+    name: Qwen3.8-Flash-Next
+    quantization: "NVFP4 (vLLM --quantization modelopt)"
+    lab: Alibaba
+    variant: Flash
+    serving:
+      context_length: 262144
+      kv_cache_dtype: unspecified
+      tensor_parallel: 1
+      gpus: "1x RTX PRO 6000 Blackwell Max-Q"
+      reasoning_effort: unspecified
+      stack: "vLLM (vllm/vllm-openai:nightly, MTP speculative decode x3)"
+      notes: "port 8005; prefix caching + chunked prefill; --max-num-seqs 4; qwen3 reasoning and qwen3_coder tool parsers"
+    agent:
+      name: mini-swe-agent
+      model_name: openai/qwen3.8-flash-next
+      env:
+        OPENAI_BASE_URL: http://172.17.0.1.nip.io/v1
+        OPENAI_API_KEY: dummy
+        MSWEA_API_KEY: dummy
+      kwargs:
+        model_class: litellm
+
+  # Laguna-S-2.1, served by vLLM on port 8005 (container laguna-s-2.1-nvfp4).
+  # Direct path: the forwarder must point at the model server
+  #   python3 eval/deepswe_eval.py forwarder start --target 127.0.0.1:8005
+  # NOTE: this server returns its thinking in a non-standard `reasoning` field and
+  # always reports reasoning_tokens = 0, so the reasoning metrics will read zero.
+  laguna-s-2.1:
+    name: Laguna-S-2.1
+    quantization: "NVFP4"
+    lab: Poolside
+    variant: S
+    serving:
+      context_length: 1048576
+      kv_cache_dtype: fp8
+      tensor_parallel: 2
+      gpus: "2x RTX PRO 6000 Blackwell Max-Q"
+      reasoning_effort: "enable_thinking=true (chat template)"
+      stack: "vLLM (vllm/vllm-openai:nightly, DFlash speculative decode x7 from /draft)"
+      notes: "port 8005; prefix caching + chunked prefill; --max-num-seqs 4; poolside_v1 reasoning and tool parsers; --disable-custom-all-reduce"
+    agent:
+      name: mini-swe-agent
+      model_name: openai/laguna-s-2.1
+      env:
+        OPENAI_BASE_URL: http://172.17.0.1.nip.io/v1
+        OPENAI_API_KEY: dummy
+        MSWEA_API_KEY: dummy
       kwargs:
         model_class: litellm
 
