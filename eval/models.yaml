@@ -20,6 +20,12 @@
 # Responses adapter for `openai/...` models.
 #
 # `env` values support ${VAR} and ${VAR:-default} expansion from your shell.
+#
+# Optional `agent.verify_served_alias: true` makes the nightly runner require the
+# endpoint to advertise the requested alias on /v1/models before it starts a
+# batch. Set it when another server can hold the same port: sglang answers 200
+# for any model name, so a chat probe alone would pass while the wrong model is
+# the one serving.
 
 models:
   # Routed through LiteLLM (the default forwarder target).
@@ -103,6 +109,12 @@ models:
   # Qwen3.8-Flash-Next, served by vLLM on port 8005 (container vllm-qwen-flash-next).
   # Direct path: the forwarder must point at the model server
   #   python3 eval/deepswe_eval.py forwarder start --target 127.0.0.1:8005
+  # Launched from ~/services/tesla-docker (profile "hybrid", manual):
+  #   docker compose --profile hybrid up -d vllm-qwen-flash-nvfp4
+  # Deployment since 2026-10-15: TP=2 on both GPUs (the 123.6 GiB of weights do
+  # not fit on one 96 GB card). The five Rust tasks of 2026-10-09/10 were run
+  # under the earlier TP=1 deployment; the stored serving block of those runs
+  # still says tensor_parallel 1, and only speed differs between the two.
   qwen3.8-flash-next:
     name: Qwen3.8-Flash-Next
     quantization: "NVFP4 (vLLM --quantization modelopt)"
@@ -111,14 +123,58 @@ models:
     serving:
       context_length: 262144
       kv_cache_dtype: unspecified
-      tensor_parallel: 1
-      gpus: "1x RTX PRO 6000 Blackwell Max-Q"
+      tensor_parallel: 2
+      gpus: "2x RTX PRO 6000 Blackwell Max-Q"
       reasoning_effort: unspecified
       stack: "vLLM (vllm/vllm-openai:nightly, MTP speculative decode x3)"
-      notes: "port 8005; prefix caching + chunked prefill; --max-num-seqs 4; qwen3 reasoning and qwen3_coder tool parsers"
+      notes: "port 8005; TP=2; prefix caching + chunked prefill + async scheduling; --max-num-seqs 4; qwen3 reasoning and qwen3_coder tool parsers"
     agent:
       name: mini-swe-agent
       model_name: openai/qwen3.8-flash-next
+      env:
+        OPENAI_BASE_URL: http://172.17.0.1.nip.io/v1
+        OPENAI_API_KEY: dummy
+        MSWEA_API_KEY: dummy
+      kwargs:
+        model_class: litellm
+
+  # Qwen3.8-Flash-Next-FP4-Local: NVIDIA's NVFP4/CSF checkpoint of the same
+  # model as `qwen3.8-flash-next`, served on port 8005 by the community image
+  # that can read the compressed CSF scales.
+  # Two deployments, both from ~/services/tesla-docker (manual profiles):
+  #   TP=1, 262144 context, GPU 0  -> profile qwen38-fp4-local
+  #     (2026-10-16 phase 1: 25 tasks measured, then stopped to widen the window)
+  #   TP=2, 1048576 context, both GPUs -> profile qwen38-fp4-local-tp2
+  #     docker compose --profile qwen38-fp4-local-tp2 up -d qwen38-flash-next-fp4-local-tp2
+  # A single GPU cannot hold a 1M session (its pool is ~795K tokens), so the
+  # long-context runs need TP=2; the serving block below describes TP=2.
+  # Two things matter for the harness:
+  #   * the server advertises the alias `qwen38-flash-next` (not
+  #     `qwen3.8-flash-next`), so the agent must request that exact name;
+  #   * the 51B n-gram embedding (PLE) table lives in host RAM (~27 GiB) and the
+  #     96 GiB checkpoint streams through page cache while loading, so the
+  #     machine needs its RAM to itself (`free -g`; with GLM loaded only 16 GB
+  #     were available on 2026-10-16).
+  # The forwarder already targets 8005, so it needs no repointing.
+  qwen3.8-flash-next-fp4-local:
+    name: Qwen3.8-Flash-Next-FP4-Local
+    quantization: "NVFP4 CSF (NVIDIA ModelOpt v0.47.0, QAD FP4 1.0)"
+    lab: Alibaba
+    variant: Flash
+    serving:
+      context_length: 1048576
+      kv_cache_dtype: fp8
+      tensor_parallel: 2
+      gpus: "2x RTX PRO 6000 Blackwell Max-Q"
+      reasoning_effort: unspecified
+      stack: "vLLM (ghcr.io/local-inference-lab/vllm:release-10152026, lil-serve preset qwen38-tp2, b12x backends, MTP x3)"
+      notes: "port 8005; 1M context via YaRN factor 4 over the 262144 config positions; pool 6328464 tokens = 6.04x of 1M per request; --max-num-seqs 4; mamba-cache-mode align; PLE table in host RAM; qwen3_xml tool parser"
+    agent:
+      name: mini-swe-agent
+      model_name: openai/qwen38-flash-next
+      # The GLM server (sglang) answers any requested model name on port 8005,
+      # so the chat probe alone cannot tell whether this model is the one up.
+      verify_served_alias: true
       env:
         OPENAI_BASE_URL: http://172.17.0.1.nip.io/v1
         OPENAI_API_KEY: dummy

@@ -156,7 +156,9 @@ def model_reachable(model_id: str) -> bool:
     The probe uses the same base URL the agent uses, so it exercises the real
     path (egress proxy -> port-80 forwarder -> whichever server the forwarder
     targets), not just LiteLLM. It accepts only a well-formed chat completion:
-    a model server that ignores the requested name can still answer 200.
+    a model server that ignores the requested name can still answer 200, which
+    is why a registry entry can set `agent.verify_served_alias: true` to also
+    require the endpoint to advertise the requested alias on /v1/models.
     """
     models = H.load_models()
     agent = (models.get(model_id, {}) or {}).get("agent") or {}
@@ -184,7 +186,39 @@ def model_reachable(model_id: str) -> bool:
         body = json.loads(proc.stdout)
     except (json.JSONDecodeError, TypeError):
         return False
-    return bool(body.get("choices"))
+    if not body.get("choices"):
+        return False
+    if not agent.get("verify_served_alias"):
+        return True
+    # Opt-in guard for servers that answer any model name. sglang and a vLLM
+    # started without the requested alias both return 200 for a name they do not
+    # serve, so a whole window could be recorded under a model that never ran.
+    wanted = model_name.split("/")[-1]
+    listed = advertised_model_ids(base, key)
+    if listed is None or wanted not in listed:
+        log(
+            f"endpoint for {model_id} advertises {listed} but not {wanted!r}; "
+            f"another model is probably holding the port"
+        )
+        return False
+    return True
+
+
+def advertised_model_ids(base: str, key: str) -> list[str] | None:
+    """Model ids the endpoint lists on /v1/models, or None if unreadable."""
+    proc = subprocess.run(
+        ["curl", "-s", "--max-time", "30",
+         "-H", f"Authorization: Bearer {key}", f"{base}/models"],
+        capture_output=True, text=True, check=False,
+    )
+    try:
+        body = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    data = body.get("data")
+    if not isinstance(data, list):
+        return None
+    return [str(item.get("id", "")) for item in data if isinstance(item, dict)]
 
 
 def unique_run_id(night: str) -> str:
